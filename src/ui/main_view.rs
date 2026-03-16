@@ -134,8 +134,6 @@ fn render_card(f: &mut Frame, app: &App, idx: usize, sound: &Sound, area: Rect) 
         } else {
             Color::Black
         }
-    } else if selected {
-        Color::Reset
     } else {
         Color::Reset
     };
@@ -211,4 +209,3 @@ fn render_card(f: &mut Frame, app: &App, idx: usize, sound: &Sound, area: Rect) 
 
     f.render_widget(p, area);
 }
-

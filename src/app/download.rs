@@ -251,7 +251,7 @@ impl App {
                     let stdout = child.stdout.take().unwrap();
                     let stderr = child.stderr.take().unwrap();
 
-                    let (err_tx, ___) = std::sync::mpsc::channel();
+                    let (err_tx, _rx) = std::sync::mpsc::channel();
                     std::thread::spawn(move || {
                         let reader = BufReader::new(stderr);
                         for line in reader.lines().map_while(Result::ok) {

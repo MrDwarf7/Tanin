@@ -1,26 +1,20 @@
 mod app;
 mod audio;
 mod config;
+mod init;
 mod presets;
 mod session;
 mod static_data;
 mod ui;
 mod buffered;
 
+use crate::app::{App, CurrentView};
 use anyhow::Result;
-use app::{App, CurrentView};
 use clap::Parser;
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use log::LevelFilter;
+use crossterm::event::{self, Event, KeyCode};
 use ratatui::{backend::CrosstermBackend, Terminal};
-use simplelog::{Config, WriteLogger};
 use std::io;
 use std::time::Duration;
-use std::{fs::File, os::fd::AsFd};
 
 use std::panic;
 
@@ -35,80 +29,20 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if args.debug {
-        let log_file = File::create("tanin.log")?;
+    init::setup_loggging(args.debug)?;
+    panic::set_hook(Box::new(init::handle_panic));
+    let mut terminal = init::setup_terminal()?;
 
-        nix::unistd::dup2_stderr(log_file.as_fd())
-            .map_err(|e| anyhow::anyhow!("Failed to redirect stderr: {}", e))?;
-
-        let log_file_clone = log_file.try_clone()?;
-
-        let _ = WriteLogger::init(LevelFilter::Debug, Config::default(), log_file_clone);
-        log::info!("Starting Tanin in debug mode");
-    } else {
-        // Redirect stderr to /dev/null to suppress errors in TUI
-        if let Ok(dev_null) = File::open("/dev/null") {
-            nix::unistd::dup2_stderr(dev_null.as_fd())
-                .map_err(|e| anyhow::anyhow!("Failed to redirect stderr: {}", e))?;
-        }
-    }
-
-    // Register panic hook to restore terminal and log panic
-    panic::set_hook(Box::new(|info| {
-        // Attempt to restore terminal state first so user can see output
-        let _ = disable_raw_mode();
-        let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
-        let _ = crossterm::execute!(stdout, crossterm::cursor::Show);
-
-        // Log to file if initialized
-        let msg = match info.payload().downcast_ref::<&str>() {
-            Some(s) => *s,
-            None => match info.payload().downcast_ref::<String>() {
-                Some(s) => &s[..],
-                None => "Box<Any>",
-            },
-        };
-
-        let location = info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let log_msg = format!("PANIC: '{}' at {}", msg, location);
-        log::error!("{}", log_msg);
-
-        // Also print to stderr for immediate feedback
-        eprintln!("{}", log_msg);
-    }));
-
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    // Create app
     let mut app = App::new()?;
 
-    // Run loop
     let res = run_app(&mut terminal, &mut app);
 
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    init::restore_terminal(&mut terminal)?;
 
     if let Err(err) = res {
         eprintln!("{:?}", err);
     }
 
-    // Save config
     app.save_session();
 
     Ok(())
@@ -262,13 +196,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                                         }
                                         _ => {}
                                     },
-                                    CurrentView::DownloadingAssets => {
+                                    CurrentView::DownloadingAssets
                                         if app.asset_download_error.is_some()
-                                            && key.code == KeyCode::Esc
-                                        {
-                                            app.view = CurrentView::Main;
-                                            app.asset_download_error = None;
-                                        }
+                                            && key.code == KeyCode::Esc =>
+                                    {
+                                        app.view = CurrentView::Main;
+                                        app.asset_download_error = None;
                                     }
                                     _ => {}
                                 },
@@ -354,16 +287,16 @@ fn handle_main_keys(app: &mut App, code: KeyCode) {
 
 fn handle_presets_keys(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Up | KeyCode::Char('k') => {
-            if app.preset_cursor_pos > 0 {
-                app.preset_cursor_pos -= 1;
-            }
+        KeyCode::Up | KeyCode::Char('k') if app.preset_cursor_pos > 0 => {
+            app.preset_cursor_pos -= 1;
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if app.preset_cursor_pos < app.presets_config.presets.len().saturating_sub(1) {
-                app.preset_cursor_pos += 1;
-            }
+        KeyCode::Up | KeyCode::Char('k') => {}
+        KeyCode::Down | KeyCode::Char('j')
+            if app.preset_cursor_pos < app.presets_config.presets.len().saturating_sub(1) =>
+        {
+            app.preset_cursor_pos += 1;
         }
+        KeyCode::Down | KeyCode::Char('j') => {}
         KeyCode::Enter => {
             app.load_preset(app.preset_cursor_pos);
         }
@@ -424,14 +357,13 @@ fn handle_add_sound_keys(app: &mut App, key: crossterm::event::KeyEvent) {
                 app.add_sound_focus_index -= 1;
             }
         }
-        KeyCode::Right => {
-            if app.add_sound_focus_index == 1 {
-                if let Some(suggestion) = &app.add_sound_suggestion {
-                    app.add_sound_category = suggestion.clone();
-                    app.add_sound_suggestion = None;
-                }
+        KeyCode::Right if app.add_sound_focus_index == 1 => {
+            if let Some(suggestion) = &app.add_sound_suggestion {
+                app.add_sound_category = suggestion.clone();
+                app.add_sound_suggestion = None;
             }
         }
+        KeyCode::Right => {}
         KeyCode::Enter => {
             if app.add_sound_focus_index == 3 {
                 app.start_download();
