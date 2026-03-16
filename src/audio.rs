@@ -101,7 +101,7 @@ pub struct AudioEngine {
 struct PreferredDevice(Option<cpal::Device>, &'static str);
 
 impl AudioEngine {
-    pub fn new() -> Result<Self> {
+    pub fn try_new() -> Result<Self> {
         let available_hosts = cpal::available_hosts();
         log::info!("Available audio hosts: {:?}", available_hosts);
 

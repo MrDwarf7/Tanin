@@ -1,7 +1,11 @@
 use super::App;
 
 impl App {
-    pub fn update_grid_cols(&mut self) {
+    #[inline(always)]
+    pub fn update_grid_cols(&mut self, width: u16, height: u16) {
+        self.width = width;
+        self.height = height;
+
         let card_width = 24; // 22 + 2 margin
         let cols = (self.width.saturating_sub(4)) / card_width;
         self.grid_cols = if cols < 1 { 1 } else { cols };

@@ -12,18 +12,29 @@ pub fn render_asset_prompt(f: &mut Frame, _app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
 
-    let text = vec![
-        "Bundled sound assets are missing.",
-        "They are required for the default experience.",
-        "",
-        "Download them from GitHub? (~17MB)",
-        "",
-        "[Enter] Download    [Esc] Skip (Empty app)",
-    ];
+    // let text = [
+    //     "Bundled sound assets are missing.",
+    //     "They are required for the default experience.",
+    //     "",
+    //     "Download them from GitHub? (~17MB)",
+    //     "",
+    //     "[Enter] Download    [Esc] Skip (Empty app)",
+    // ];
 
-    let p = Paragraph::new(text.join("\n"))
-        .block(block)
-        .alignment(Alignment::Center);
+    let text = r#"
+        Bundled sound assets are missing.
+        They are required for the default experience.
+        
+        Download them from GitHub? (~17MB)
+        
+        [Enter] Download    [Esc] Skip (Empty app)
+        "#;
+
+    let p = Paragraph::new(
+        text, // text.join("\n")
+    )
+    .block(block)
+    .alignment(Alignment::Center);
 
     let area = center_rect(area, 60, 10);
     f.render_widget(Clear, area);

@@ -8,10 +8,17 @@ use crate::audio::AudioEngine;
 use crate::config::Config;
 use crate::presets::PresetsConfig;
 use crate::session::{Session, SoundState};
-use crate::static_data::{check_assets, get_bundled_sounds, AssetStatus, Sound};
+use crate::static_data::{get_active_assets_path, get_bundled_sounds, Sound};
 use anyhow::Result;
+use crossterm::event::{Event, KeyCode, KeyEvent};
 pub use download::{DownloadEvent, DownloadStatus, DownloadTask};
 use std::sync::mpsc::Receiver;
+
+#[derive(Debug, PartialEq)]
+pub enum Action {
+    Continue,
+    Quit,
+}
 
 pub enum AssetDownloadEvent {
     ConfigDownloaded(Vec<Sound>),
@@ -37,7 +44,7 @@ pub struct App {
     pub session: Session,
     pub presets_config: PresetsConfig,
     pub quitting: bool,
-    pub grid_cols: u16,
+    pub grid_cols: u16, // is grid_cols basically `height` ?????
     pub width: u16,
     pub height: u16,
     pub muted: bool,
@@ -79,11 +86,7 @@ pub struct App {
 impl App {
     /// Create app
     pub fn new() -> Result<Self> {
-        let config = Config::load()?;
         let session = Session::load()?;
-        let presets_config = PresetsConfig::load().unwrap_or_default();
-
-        let audio_engine = AudioEngine::new().ok();
 
         // Check yt-dlp availability
         let yt_dlp_available = std::process::Command::new("yt-dlp")
@@ -98,10 +101,10 @@ impl App {
             sounds: Vec::new(),
             cursor_pos: 0,
             view: CurrentView::Main,
-            audio_engine,
-            config: config.clone(),
+            audio_engine: AudioEngine::try_new().ok(),
+            config: Config::load()?,
             session: session.clone(),
-            presets_config,
+            presets_config: PresetsConfig::load().unwrap_or_default(),
             quitting: false,
             grid_cols: 1,
             width: 80,
@@ -135,10 +138,9 @@ impl App {
             asset_download_error: None,
         };
 
-        if check_assets() == AssetStatus::Missing {
-            app.view = CurrentView::AssetMissing;
-        } else if config.general.enable_bundled_sounds {
-            app.sounds.extend(get_bundled_sounds());
+        match get_active_assets_path() {
+            Some(path) => app.sounds.extend(get_bundled_sounds(&path)),
+            None => app.view = CurrentView::AssetMissing,
         }
 
         app.sounds.extend(crate::static_data::load_custom_sounds());
@@ -170,6 +172,372 @@ impl App {
         Ok(app)
     }
 
+    pub fn handle_event(&mut self, event: Event) -> Result<Action> {
+        match event {
+            Event::Key(key) => self.handle_key_event(key),
+            Event::Mouse(mouse) => {
+                self.handle_mouse_event(mouse);
+                Ok(Action::Continue)
+            }
+            Event::Resize(width, height) => {
+                self.update_grid_cols(width, height);
+                Ok(Action::Continue)
+            }
+            _ => Ok(Action::Continue),
+        }
+    }
+
+    fn handle_key_event(&mut self, key: KeyEvent) -> Result<Action> {
+        // Helper closure to check for Ctrl + char combinations
+        let key_with_ctrl = |event: KeyEvent, char: char| {
+            event.code == KeyCode::Char(char)
+                && key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL)
+        };
+
+        if self.view == CurrentView::Help {
+            if key.code == KeyCode::Char('q') || key_with_ctrl(key, 'c') {
+                return Ok(Action::Quit);
+            }
+            self.view = CurrentView::Main;
+            return Ok(Action::Continue);
+        }
+
+        if self.preset_input_mode {
+            match key.code {
+                KeyCode::Enter => {
+                    self.confirm_preset_input();
+                    self.preset_input_mode = false;
+                    self.preset_input_buffer.clear();
+                }
+
+                KeyCode::Esc => {
+                    self.preset_input_mode = false;
+                    self.preset_rename_target = None;
+                    self.preset_input_buffer.clear();
+                }
+                KeyCode::Backspace => {
+                    self.preset_input_buffer.pop();
+                }
+                KeyCode::Char(c) => self.preset_input_buffer.push(c),
+                _ => {}
+            }
+            return Ok(Action::Continue);
+        }
+
+        if self.search_mode {
+            match key.code {
+                KeyCode::Enter => self.search_mode = false,
+                KeyCode::Esc => {
+                    self.search_mode = false;
+                    self.search_query.clear();
+                    self.scroll_into_view();
+                }
+                KeyCode::Backspace => {
+                    self.search_query.pop();
+                    self.validate_cursor_position();
+                }
+
+                KeyCode::Char(c) => {
+                    self.search_query.push(c);
+                    self.validate_cursor_position();
+                }
+                _ => {}
+            }
+            return Ok(Action::Continue);
+        }
+
+        if self.view == CurrentView::Downloads {
+            if key.code == KeyCode::Tab {
+                self.view = CurrentView::Main;
+            } else {
+                self.handle_add_sound_keys(key);
+                // handle_add_sound_keys(app, key);
+            }
+
+            return Ok(Action::Continue);
+        }
+
+        match key.code {
+            KeyCode::Char('q') => {
+                self.quitting = true;
+                Ok(Action::Quit)
+            }
+            KeyCode::Esc => {
+                if !self.search_query.is_empty() {
+                    self.search_query.clear();
+                    self.scroll_into_view();
+                    Ok(Action::Continue)
+                } else {
+                    self.quitting = true;
+                    Ok(Action::Quit)
+                }
+            }
+            // KeyCode::Char('c') if key .modifiers .contains(crossterm::event::KeyModifiers::CONTROL) => {
+            KeyCode::Char('c') if key_with_ctrl(key, 'c') => {
+                self.quitting = true;
+                Ok(Action::Quit)
+            }
+
+            KeyCode::Tab => {
+                self.view = match self.view {
+                    CurrentView::Main => CurrentView::Presets,
+                    CurrentView::Presets => {
+                        if self.yt_dlp_available {
+                            CurrentView::Downloads
+                        } else {
+                            CurrentView::Main
+                        }
+                    }
+                    CurrentView::Downloads => CurrentView::Main,
+                    _ => CurrentView::Main,
+                };
+                Ok(Action::Continue)
+            }
+
+            // Help
+            KeyCode::Char('?') => {
+                self.view = CurrentView::Help;
+                Ok(Action::Continue)
+            }
+
+            // Add Sound
+            KeyCode::Char('a') if self.view == CurrentView::Main => {
+                if self.yt_dlp_available {
+                    self.view = CurrentView::Downloads;
+                    self.add_sound_name.clear();
+                    self.add_sound_category.clear();
+                    self.add_sound_url.clear();
+                    self.add_sound_status.clear();
+                    self.add_sound_focus_index = 0;
+                    self.add_sound_suggestion = None;
+                }
+                Ok(Action::Continue)
+            }
+
+            // Master Mute
+            KeyCode::Char('m') => {
+                self.toggle_mute();
+                Ok(Action::Continue)
+            }
+
+            _ => {
+                match self.view {
+                    CurrentView::Main => self.handle_main_keys(key.code),
+                    CurrentView::Presets => self.handle_presets_keys(key.code),
+                    CurrentView::Downloads => self.handle_add_sound_keys(key),
+                    CurrentView::AssetMissing => match key.code {
+                        KeyCode::Enter => self.start_asset_download(),
+                        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+                            self.view = CurrentView::Main
+                        }
+                        _ => {}
+                    },
+                    CurrentView::DownloadingAssets
+                        if self.asset_download_error.is_some() && key.code == KeyCode::Esc =>
+                    {
+                        self.view = CurrentView::Main;
+                        self.asset_download_error = None;
+                    }
+                    _ => {}
+                }
+                Ok(Action::Continue)
+            }
+        }
+    }
+
+    fn handle_presets_keys(&mut self, code: KeyCode) {
+        match code {
+            // BUG: @mrdwarf7 [enum_over_index] :
+            KeyCode::Up | KeyCode::Char('k') if self.preset_cursor_pos > 0 => {
+                self.preset_cursor_pos -= 1;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {}
+            KeyCode::Down | KeyCode::Char('j')
+                if self.preset_cursor_pos < self.presets_config.presets.len().saturating_sub(1) =>
+            {
+                self.preset_cursor_pos += 1;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {}
+            KeyCode::Enter => {
+                self.load_preset(self.preset_cursor_pos);
+            }
+            KeyCode::Char('n') => {
+                self.preset_input_mode = true;
+            }
+            KeyCode::Char('r') => {
+                self.start_renaming_preset();
+            }
+            KeyCode::Char('u') => {
+                self.update_preset_sounds();
+            }
+            KeyCode::Char('d') => {
+                self.delete_preset(self.preset_cursor_pos);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_main_keys(&mut self, code: KeyCode) {
+        match code {
+            // Navigation
+            KeyCode::Char('/') => {
+                self.search_mode = true;
+                self.search_query.clear();
+            }
+            KeyCode::Left | KeyCode::Char('h') => self.move_left(),
+            KeyCode::Right | KeyCode::Char('l') => self.move_right(),
+            KeyCode::Up | KeyCode::Char('k') => self.move_up(),
+            KeyCode::Down | KeyCode::Char('j') => self.move_down(),
+
+            // Sound Control
+            KeyCode::Enter | KeyCode::Char(' ') => self.toggle_current_sound(),
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                let vol = self
+                    .sounds
+                    .get(self.cursor_pos)
+                    .map(|sound| sound.volume_linear);
+
+                if let Some(v) = vol {
+                    self.set_current_volume(v + 0.1);
+                }
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') => {
+                let vol = self
+                    .sounds
+                    .get(self.cursor_pos)
+                    .map(|sound| sound.volume_linear);
+
+                if let Some(v) = vol {
+                    self.set_current_volume(v - 0.1);
+                }
+            }
+
+            // Quick Volume
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                if let Some(d) = c.to_digit(10) {
+                    let vol = if d == 0 { 1.0 } else { d as f32 / 10.0 };
+                    self.set_current_volume(vol);
+                }
+            }
+
+            // Master Volume
+            KeyCode::Char('<') | KeyCode::Char(',') => {
+                self.set_master_volume(self.session.global_volume - 0.1);
+            }
+            KeyCode::Char('>') | KeyCode::Char('.') => {
+                self.set_master_volume(self.session.global_volume + 0.1);
+            }
+
+            // Stop All
+            KeyCode::Char('s') => self.stop_all(),
+
+            _ => {}
+        }
+    }
+
+    fn handle_add_sound_keys(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.view = CurrentView::Main;
+                self.add_sound_name.clear();
+                self.add_sound_category.clear();
+                self.add_sound_url.clear();
+                self.add_sound_status.clear();
+                self.add_sound_suggestion = None;
+            }
+            KeyCode::Down => {
+                self.add_sound_focus_index = (self.add_sound_focus_index + 1) % 4;
+            }
+            KeyCode::Up => {
+                if self.add_sound_focus_index == 0 {
+                    self.add_sound_focus_index = 3;
+                } else {
+                    self.add_sound_focus_index -= 1;
+                }
+            }
+            KeyCode::Right if self.add_sound_focus_index == 1 => {
+                if let Some(suggestion) = &self.add_sound_suggestion {
+                    self.add_sound_category = suggestion.clone();
+                    self.add_sound_suggestion = None;
+                }
+            }
+            KeyCode::Right => {}
+            KeyCode::Enter => {
+                if self.add_sound_focus_index == 3 {
+                    self.start_download();
+                } else {
+                    self.add_sound_focus_index += 1;
+                }
+            }
+            // BUG: @mrdwarf7 [enum_over_index] : This kind of state 'indexing' is incredibly brittle
+            // and fits the Rust use-case for pattern matching on enums much better.
+            // I would strongly recommend refactoring this to be an enum representing the current
+            // field in focus, and then match on that enum instead of using an index. This would
+            // make the code much more readable and maintainable, and reduce the chances of bugs due
+            // to incorrect indexing.
+            //
+            KeyCode::Backspace => {
+                let buffer = match self.add_sound_focus_index {
+                    0 => &mut self.add_sound_name,
+                    1 => &mut self.add_sound_category,
+                    2 => &mut self.add_sound_icon,
+                    3 => &mut self.add_sound_url,
+                    _ => return,
+                };
+                buffer.pop();
+
+                if self.add_sound_focus_index == 1 {
+                    self.update_suggestion();
+                }
+            }
+
+            // BUG: @mrdwarf7 [enum_over_index] : This kind of state 'indexing' is incredibly brittle
+            // and fits the Rust use-case for pattern matching on enums much better.
+            // I would strongly recommend refactoring this to be an enum representing the current
+            // field in focus, and then match on that enum instead of using an index. This would
+            // make the code much more readable and maintainable, and reduce the chances of bugs due
+            // to incorrect indexing.
+            //
+            KeyCode::Char(c) => {
+                let buffer = match self.add_sound_focus_index {
+                    0 => &mut self.add_sound_name,
+                    1 => &mut self.add_sound_category,
+                    2 => &mut self.add_sound_icon,
+                    3 => &mut self.add_sound_url,
+                    _ => return,
+                };
+                buffer.push(c);
+
+                if self.add_sound_focus_index == 1 {
+                    self.update_suggestion();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn update_suggestion(&mut self) {
+        if self.add_sound_category.is_empty() {
+            self.add_sound_suggestion = None;
+            return;
+        }
+
+        let input = self.add_sound_category.to_lowercase();
+        let categories: Vec<String> = self.sounds.iter().map(|s| s.category.clone()).collect();
+
+        // Find first category that starts with input and is longer
+        if let Some(cat) = categories
+            .iter()
+            .find(|c| c.to_lowercase().starts_with(&input) && c.len() > input.len())
+        {
+            self.add_sound_suggestion = Some(cat.clone());
+        } else {
+            self.add_sound_suggestion = None;
+        }
+    }
+
     pub fn start_asset_download(&mut self) {
         let (tx, rx) = std::sync::mpsc::channel();
         self.asset_download_rx = Some(rx);
@@ -186,63 +554,67 @@ impl App {
         });
     }
 
+    // TODO: @mdwarf7 [refactor] : This function is huge and does way too much.
+    // This can be _drastically_ simplified using a sort of
+    // 'asset download manager' with a queue + tx/rx implementation.
+    // Just attach a channel end to the App struct, and when something happens, send
+    // and event to the DL manager, and wait (or poll on it), then update UI
+    // on if we were successful or not. This would also make it much easier to add a 'download
+    // progress' UI, and would cleanly separate concerns of downloading assets from the main app
+    // logic.
+    //
     pub fn update(&mut self, dt: std::time::Duration) {
-        // BUG: @mrdwarf7 : This never actually loops
-        // If we want to poll our recv. we should either use
-        // `while let Ok(event) = rx.try_recv()`
-        // or just use the match directly without the loop since we break on Empty or Disconnected
-        // anyway.
-
         if let Some(rx) = &self.asset_download_rx {
-            loop {
-                match rx.try_recv() {
-                    Ok(AssetDownloadEvent::ConfigDownloaded(sounds)) => {
-                        self.asset_download_rx = None;
+            match rx.try_recv() {
+                Ok(AssetDownloadEvent::ConfigDownloaded(sounds)) => {
+                    self.asset_download_rx = None;
 
-                        // Populate queue
-                        for sound in sounds {
-                            if !std::path::Path::new(&sound.file_path).exists() {
-                                if let Some(url) = &sound.url {
-                                    self.download_queue.push(DownloadTask {
-                                        name: sound.name.clone(),
-                                        category: sound.category.clone(),
-                                        url: url.clone(),
-                                        status: DownloadStatus::Pending,
-                                        icon: sound.icon.clone(),
-                                        target_filename: std::path::Path::new(&sound.file_path)
-                                            .file_name()
-                                            .map(|s| s.to_string_lossy().to_string()),
-                                    });
-                                }
+                    // Populate queue
+                    for sound in sounds {
+                        if !std::path::Path::new(&sound.file_path).exists() {
+                            if let Some(url) = &sound.url {
+                                self.download_queue.push(DownloadTask {
+                                    name: sound.name.clone(),
+                                    category: sound.category.clone(),
+                                    url: url.clone(),
+                                    status: DownloadStatus::Pending,
+                                    icon: sound.icon.clone(),
+                                    target_filename: std::path::Path::new(&sound.file_path)
+                                        .file_name()
+                                        .map(|s| s.to_string_lossy().to_string()),
+                                });
                             }
                         }
+                    }
 
-                        // Reload sounds to pick up the new config
-                        if self.config.general.enable_bundled_sounds {
-                            self.sounds = get_bundled_sounds();
+                    // Reload sounds to pick up the new config
+                    if self.config.general.enable_bundled_sounds {
+                        if let Some(path) = get_active_assets_path() {
+                            self.sounds = get_bundled_sounds(path);
                         }
-                        self.sounds.extend(crate::static_data::load_custom_sounds());
-                        self.sort_sounds();
+                    }
+                    self.sounds.extend(crate::static_data::load_custom_sounds());
+                    self.sort_sounds();
 
-                        // Switch to Downloads view
-                        self.view = CurrentView::Downloads;
-                        // Force yt_dlp available check just in case, though we checked at start
-                        // If it's false, the user will see an empty download list or we should warn them.
-                        // But we assume they have it if they chose to download.
+                    // Switch to Downloads view
+                    self.view = CurrentView::Downloads;
+                    // Force yt_dlp available check just in case, though we checked at start
+                    // If it's false, the user will see an empty download list or we should warn them.
+                    // But we assume they have it if they chose to download.
 
-                        break;
-                    }
-                    Ok(AssetDownloadEvent::Error(e)) => {
-                        self.asset_download_rx = None;
-                        self.asset_download_error = Some(e);
-                        break;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        self.asset_download_rx = None;
-                        self.asset_download_error = Some("Thread disconnected".to_string());
-                        break;
-                    }
+                    // break;
+                }
+                Ok(AssetDownloadEvent::Error(e)) => {
+                    self.asset_download_rx = None;
+                    self.asset_download_error = Some(e);
+                    // break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                // break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.asset_download_rx = None;
+                    self.asset_download_error = Some("Thread disconnected".to_string());
+                    // break;
                 }
             }
         }
@@ -353,6 +725,9 @@ impl App {
     }
 
     pub fn get_filtered_sounds(&self) -> Vec<(usize, &Sound)> {
+        // BUG: @mrdwarf7 [refactor] : Why do we constantly pull
+        // items _off_ of self/App? If we understand our data flow we shouldn't need to.
+        //
         let hidden = &self.config.general.hidden_categories;
         if self.search_query.is_empty() {
             self.sounds

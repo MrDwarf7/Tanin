@@ -59,33 +59,41 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let path = get_config_path()?;
-        if path.exists() {
-            let content = fs::read_to_string(&path)?;
-            let config: Config = toml::from_str(&content)?;
-            Ok(config)
-        } else {
-            let config = Self::default();
-            config.save()?;
-            Ok(config)
+        // if let Some(config) = CONFIG.get() {
+        //     return Ok(config.to_owned());
+        // }
+
+        let path = get_config_path();
+        if !path.exists() {
+            // CONFIG.set(Self::default()).ok();
+            return Ok(Self::default().save()?.to_owned());
         }
+
+        let config: Config = toml::from_str(
+            &std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
+
+        // CONFIG.set(config.clone()).ok();
+        Ok(config.save()?.to_owned())
     }
 
-    pub fn save(&self) -> Result<()> {
-        let path = get_config_path()?;
+    pub fn save(&self) -> Result<&'_ Self> {
+        let path = get_config_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let content = toml::to_string_pretty(self)?;
         fs::write(path, content)?;
-        Ok(())
+        Ok(self)
     }
 }
 
-fn get_config_path() -> Result<PathBuf> {
+fn get_config_path() -> PathBuf {
     if let Some(proj_dirs) = ProjectDirs::from("com", "tanin", "tanin") {
-        Ok(proj_dirs.config_dir().join("config.toml"))
+        proj_dirs.config_dir().join("config.toml")
     } else {
-        Ok(PathBuf::from("config.toml"))
+        PathBuf::from("config.toml")
     }
 }

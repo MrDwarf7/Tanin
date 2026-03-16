@@ -21,6 +21,12 @@ pub struct Sound {
     pub error_state: bool,
 }
 
+// TODO: @mrdwarf7 : `tanin::app::App::sort_sounds` should
+// be a trait impl. of `impl Ord for Sound` or `impl PartialOrd for Sound` instead of custom logic
+// in the app.
+// This is the perfect use-case for traits. We already have the custom type here anyway.
+//
+
 fn default_volume() -> f32 {
     0.5
 }
@@ -38,20 +44,6 @@ struct SoundEntry {
     #[serde(default = "default_icon")]
     pub icon: String,
     pub url: Option<String>,
-}
-
-#[derive(Debug, PartialEq)]
-pub enum AssetStatus {
-    Present,
-    Missing,
-}
-
-pub fn check_assets() -> AssetStatus {
-    if get_active_assets_path().is_some() {
-        AssetStatus::Present
-    } else {
-        AssetStatus::Missing
-    }
 }
 
 pub fn get_active_assets_path() -> Option<PathBuf> {
@@ -78,21 +70,17 @@ pub fn get_active_assets_path() -> Option<PathBuf> {
     None
 }
 
-pub fn get_bundled_sounds() -> Vec<Sound> {
-    if let Some(path) = get_active_assets_path() {
-        match load_sounds_from_file(&path) {
-            Ok(sounds) => sounds,
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to load bundled sounds from {:?}: {}. Loading empty list.",
-                    path, e
-                );
-                Vec::new()
-            }
+pub fn get_bundled_sounds<P: AsRef<Path>>(path: P) -> Vec<Sound> {
+    match load_sounds_from_file(&path) {
+        Ok(sounds) => sounds,
+        Err(e) => {
+            eprintln!(
+                "Warning: Failed to load bundled sounds from {}: {}. Loading empty list.",
+                path.as_ref().display(),
+                e
+            );
+            Vec::new()
         }
-    } else {
-        // No assets found
-        Vec::new()
     }
 }
 
