@@ -1,14 +1,13 @@
+use crate::buffered::{self, DecodeTask};
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
-use cpal::HostId;
 use magnum::container::ogg::OpusSourceOgg;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
-use std::time::Duration;
 use std::sync::mpsc::Sender;
-use crate::buffered::{self, DecodeTask};
+use std::time::Duration;
 
 struct FadingSink {
     id: String,
@@ -26,21 +25,30 @@ impl<R: std::io::Read + std::io::Seek> Iterator for MagnumOggWrapper<R> {
     }
 }
 impl<R: std::io::Read + std::io::Seek> Source for MagnumOggWrapper<R> {
-    fn current_frame_len(&self) -> Option<usize> { None }
-    fn channels(&self) -> u16 { 2 }
-    fn sample_rate(&self) -> u32 { 48000 }
-    fn total_duration(&self) -> Option<Duration> { None }
+    fn current_frame_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> u16 {
+        2
+    }
+    fn sample_rate(&self) -> u32 {
+        48000
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
 }
 
 fn create_decoder_from_path(file_path: &str) -> Result<Box<dyn Source<Item = f32> + Send>> {
     log::debug!("Opening file: {}", file_path);
-    let file = File::open(file_path).context(format!("Failed to open sound file: {}", file_path))?;
+    let file =
+        File::open(file_path).context(format!("Failed to open sound file: {}", file_path))?;
 
     log::debug!("Creating decoder for: {}", file_path);
     let file_for_closure = file.try_clone().context("Failed to clone file handle")?;
 
-    let is_opus = file_path.to_lowercase().ends_with(".opus")
-        || file_path.to_lowercase().ends_with(".webm");
+    let is_opus =
+        file_path.to_lowercase().ends_with(".opus") || file_path.to_lowercase().ends_with(".webm");
 
     if is_opus {
         log::info!("Attempting to use Magnum (Opus) decoder for: {}", file_path);
@@ -55,7 +63,9 @@ fn create_decoder_from_path(file_path: &str) -> Result<Box<dyn Source<Item = f32
         }
     }
 
-    let file_fallback = file.try_clone().context("Failed to clone file for fallback")?;
+    let file_fallback = file
+        .try_clone()
+        .context("Failed to clone file for fallback")?;
 
     // Catch panics from Rodio to prevent malformed audio files from crashing the app
     let decoder_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -88,47 +98,27 @@ pub struct AudioEngine {
     task_dispatcher: Sender<DecodeTask>,
 }
 
+struct PreferredDevice(Option<cpal::Device>, &'static str);
+
 impl AudioEngine {
     pub fn new() -> Result<Self> {
         let available_hosts = cpal::available_hosts();
         log::info!("Available audio hosts: {:?}", available_hosts);
 
-        let mut device = None;
-        let mut host_name = "Default";
+        let preferred_device = Self::try_preferred_device(&available_hosts);
 
-        #[allow(unused_mut)]
-        let mut priority_hosts: Vec<(HostId, &'static str)> = Vec::new();
-
-        #[cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd"))]
-        {
-            #[cfg(feature = "jack")]
-            priority_hosts.push((HostId::Jack, "JACK"));
-            priority_hosts.push((HostId::Alsa, "ALSA"));
-        }
-
-        for &(host_id, name_str) in &priority_hosts {
-            if available_hosts.contains(&host_id) {
-                log::debug!("Attempting to use audio host: {:?}", host_id);
-                if let Ok(host) = cpal::host_from_id(host_id) {
-                    if let Some(d) = host.default_output_device() {
-                        log::info!(
-                            "Selected audio device from host {:?}: {}",
-                            host_id,
-                            d.name().unwrap_or_else(|_| "Unknown".to_string())
-                        );
-                        device = Some(d);
-                        host_name = name_str;
-                        break;
-                    }
-                }
+        let (device, host_name) = match preferred_device {
+            PreferredDevice(Some(d), name) => (Some(d), name),
+            PreferredDevice(None, s) => {
+                log::warn!("No preferred audio host found. Falling back to default.");
+                (None, s)
             }
-        }
+        };
 
         let (_stream, stream_handle) = if let Some(d) = device {
             OutputStream::try_from_device(&d)
                 .map_err(|e| anyhow::anyhow!("Failed to create output stream from device: {}", e))?
         } else {
-            log::warn!("No preferred audio host found. Falling back to default.");
             OutputStream::try_default().context("No audio output device available")?
         };
 
@@ -147,6 +137,61 @@ impl AudioEngine {
             fade_duration: Duration::from_secs(2),
             task_dispatcher,
         })
+    }
+
+    fn try_preferred_device(available_hosts: &[cpal::HostId]) -> PreferredDevice {
+        for &host_id in Self::priority_hosts() {
+            if !available_hosts.contains(&host_id) {
+                continue;
+            }
+            log::debug!("Attempting to use audio host: {:?}", host_id);
+
+            let host = match cpal::host_from_id(host_id) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            if let Some(d) = host.default_output_device() {
+                log::info!(
+                    "Selected audio device from host {:?}: {}",
+                    host_id,
+                    d.name().unwrap_or_else(|_| "Unknown".to_string())
+                );
+
+                let host_name = match host_id {
+                    cpal::HostId::Jack => "JACK",
+                    cpal::HostId::Alsa => "ALSA",
+                };
+                return PreferredDevice(Some(d), host_name);
+            }
+        }
+
+        PreferredDevice(None, "Default")
+    }
+
+    /// Platform and feature flag handling -
+    /// Compile time selection of preferred audio hosts based on OS and features.
+    fn priority_hosts() -> &'static [cpal::HostId] {
+        #[cfg(all(
+            any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd"),
+            feature = "jack"
+        ))]
+        {
+            &[cpal::HostId::Jack]
+        }
+
+        #[cfg(all(
+            any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd"),
+            not(feature = "jack")
+        ))]
+        {
+            &[cpal::HostId::Alsa]
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd")))]
+        {
+            &[]
+        }
     }
 
     pub fn update(&mut self, dt: Duration) {

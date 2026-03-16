@@ -77,6 +77,7 @@ pub struct App {
 }
 
 impl App {
+    /// Create app
     pub fn new() -> Result<Self> {
         let config = Config::load()?;
         let session = Session::load()?;
@@ -186,6 +187,12 @@ impl App {
     }
 
     pub fn update(&mut self, dt: std::time::Duration) {
+        // BUG: @mrdwarf7 : This never actually loops
+        // If we want to poll our recv. we should either use
+        // `while let Ok(event) = rx.try_recv()`
+        // or just use the match directly without the loop since we break on Empty or Disconnected
+        // anyway.
+
         if let Some(rx) = &self.asset_download_rx {
             loop {
                 match rx.try_recv() {
@@ -418,6 +425,7 @@ impl App {
         });
     }
 
+    /// Save config
     pub fn save_session(&mut self) {
         for sound in &self.sounds {
             let enabled = if let Some(engine) = &self.audio_engine {
